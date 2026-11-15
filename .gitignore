@@ -1,0 +1,16 @@
+.venv/
+assets/
+results/
+__pycache__/
+*.py[cod]
+*.ckpt
+*.pt
+*.pth
+*.h5
+*.hdf5
+*.npz
+*.npy
+*.zip
+*.tar.gz
+*.log
+.DS_Store
