@@ -141,6 +141,45 @@ def render_states(states, rng=None):
     return np.clip(image, 0.0, 1.0)
 
 
+_RENDER_GRID_CACHE = {}
+
+
+def _render_grids(device):
+    key = str(device)
+    cached = _RENDER_GRID_CACHE.get(key)
+    if cached is None:
+        axis = torch.arange(IMG, dtype=torch.float32, device=device)
+        x = (axis / (IMG - 1)).view(1, IMG)
+        y = (axis / (IMG - 1)).view(IMG, 1)
+        bg_red = 0.045 + 0.015 * (x * y)
+        bg_blue = 0.050 + 0.015 * ((1.0 - x) * y)
+        bg_green = 0.065 + 0.020 * torch.sin(float(np.pi) * (x + y))
+        cached = (axis, bg_red, bg_green, bg_blue)
+        _RENDER_GRID_CACHE[key] = cached
+    return cached
+
+
+def render_states_torch(states_t, device, noise_gen=None):
+    """GPU-native float32 NCHW 32x32 renderer matching render_states()."""
+    device = torch.device(device)
+    axis, bg_red, bg_green, bg_blue = _render_grids(device)
+    pts = states_t.to(device=device, dtype=torch.float32).reshape(-1, 2, 2)
+    centers = 16.0 + 11.0 * torch.tanh(0.45 * pts)
+    delta = axis.view(1, 1, 1, IMG) - centers.unsqueeze(-1)
+    gauss = torch.exp(-0.5 * (delta / SIGMA).square())
+    sprites = gauss[:, :, 1, :, None] * gauss[:, :, 0, None, :]
+    red = bg_red + AMP * sprites[:, 0]
+    green = bg_green + 0.035 * (sprites[:, 0] + sprites[:, 1])
+    blue = bg_blue + AMP * sprites[:, 1]
+    images = torch.stack([red, green, blue], dim=1)
+    if noise_gen is not None and PIXEL_NOISE > 0:
+        images.add_(
+            PIXEL_NOISE
+            * torch.randn(images.shape, generator=noise_gen, device=device, dtype=torch.float32)
+        )
+    return images.clamp_(0.0, 1.0)
+
+
 # --------------------------------------------------------------------------- #
 # Encoder / SIGReg
 # --------------------------------------------------------------------------- #
@@ -166,27 +205,24 @@ class SIGReg(nn.Module):
 
     def __init__(self, dim=8, knots=17, n_slices=256, t_max=3.0):
         super().__init__()
+        self.n_slices = int(n_slices)
         t = torch.linspace(0.0, t_max, knots)
-        step = t[1] - t[0] if knots > 1 else 1.0
-        weights = torch.full_like(t, float(step))
-        weights[0] *= 0.5
-        weights[-1] *= 0.5
-        weights = weights * torch.exp(-t**2 / 2.0)
-        directions = F.normalize(torch.randn(dim, n_slices), dim=0)
+        dt = float(t_max) / (knots - 1) if knots > 1 else 1.0
+        w = torch.full((knots,), 2.0 * dt)
+        w[[0, -1]] = dt
         self.register_buffer("t", t)
-        self.register_buffer("weights", weights)
-        self.register_buffer("directions", directions)
+        self.register_buffer("phi", torch.exp(-t**2 / 2.0))
+        self.register_buffer("weights", w * torch.exp(-t**2 / 2.0))
 
     def forward(self, x):
         flat = x.reshape(-1, x.shape[-1])
-        projection = flat @ self.directions            # (N, S)
-        angle = self.t[:, None, None] * projection[None, :, :]  # (K, N, S)
-        cos_mean = torch.cos(angle).mean(dim=1)        # (K, S)
-        sin_mean = torch.sin(angle).mean(dim=1)        # (K, S)
-        phi = torch.exp(-self.t**2 / 2.0)[:, None]     # (K, 1)
-        error = (cos_mean - phi) ** 2 + sin_mean**2    # (K, S)
-        return (error * self.weights[:, None]).sum(dim=0).mean() * flat.shape[0]
-
+        a = F.normalize(
+            torch.randn(flat.size(-1), self.n_slices, device=flat.device, dtype=flat.dtype),
+            dim=0,
+        )
+        xt = (flat @ a).unsqueeze(-1) * self.t
+        err = (xt.cos().mean(0) - self.phi).square() + xt.sin().mean(0).square()
+        return (err @ self.weights).mean() * flat.size(0)
 
 class Predictor(nn.Module):
     def __init__(self, dim=8, hidden=32):
@@ -207,6 +243,7 @@ def pretrain_encoder(pretrain_states, *, mode, lag, w_sig, seed, device,
     """mode='symmetric_lejepa' or 'predictor'."""
     if mode not in ("symmetric_lejepa", "predictor"):
         raise ValueError(f"Unknown pretrain mode {mode!r}")
+    device = torch.device(device)
     set_seed(seed)
     rng = rng or np.random.default_rng(seed)
     encoder = SpriteEncoder(8).to(device)
@@ -221,43 +258,69 @@ def pretrain_encoder(pretrain_states, *, mode, lag, w_sig, seed, device,
         raise ValueError("pretrain sequences are too short for the shared anchor set")
     anchors = seq_len - MAX_LAG
     trace = []
-    render_rng = np.random.default_rng(seed + 7919)
+
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(seed) + 7919)
+    flat_states = torch.as_tensor(
+        np.asarray(pretrain_states, dtype=np.float32).reshape(-1, 4), device=device
+    )
+    n_total = flat_states.shape[0]
+    pretrain_imgs = None
+    states_gpu = None
+    if n_total <= 200_000:
+        pretrain_imgs = torch.empty((n_total, 3, IMG, IMG), dtype=torch.float32, device=device)
+        for start in range(0, n_total, 16384):
+            end = min(start + 16384, n_total)
+            pretrain_imgs[start:end] = render_states_torch(
+                flat_states[start:end], device=device, noise_gen=gen
+            )
+        pretrain_imgs = pretrain_imgs.view(n_episodes, seq_len, 3, IMG, IMG)
+    else:
+        states_gpu = flat_states.view(n_episodes, seq_len, 4)
+    del flat_states
+
+    ep_all = torch.as_tensor(rng.integers(0, n_episodes, (steps, batch)), dtype=torch.long, device=device)
+    anc_all = torch.as_tensor(rng.integers(0, anchors, (steps, batch)), dtype=torch.long, device=device)
     encoder.train()
+    if predictor is not None:
+        predictor.train()
     for step in range(1, steps + 1):
-        episode = rng.integers(0, n_episodes, batch)
-        anchor = rng.integers(0, anchors, batch)
-        current_states = pretrain_states[episode, anchor]
-        target_states = pretrain_states[episode, anchor + lag]
-        current = torch.from_numpy(render_states(current_states, rng=render_rng)).to(device)
-        target = torch.from_numpy(render_states(target_states, rng=render_rng)).to(device)
-        z_current = encoder(current)
+        ep = ep_all[step - 1]
+        anc = anc_all[step - 1]
+        if pretrain_imgs is not None:
+            current = pretrain_imgs[ep, anc]
+            target = pretrain_imgs[ep, anc + lag]
+        else:
+            current = render_states_torch(states_gpu[ep, anc], device=device, noise_gen=gen)
+            target = render_states_torch(states_gpu[ep, anc + lag], device=device, noise_gen=gen)
         if mode == "symmetric_lejepa":
-            # Symmetric LeJEPA: both views are encoded with gradients.
-            z_target = encoder(target)
-            matching = F.mse_loss(z_current, z_target)
-            latents = torch.cat([z_current, z_target], dim=0)
+            latents = encoder(torch.cat([current, target], dim=0)).reshape(2, len(current), -1)
+            matching = F.mse_loss(latents[0], latents[1])
             loss = (1.0 - w_sig) * matching + w_sig * sigreg(latents)
         else:
+            z_current = encoder(current)
             with torch.no_grad():
                 z_target = encoder(target)
             predicted = predictor(z_current)
             matching = F.mse_loss(predicted, z_target.detach())
             loss = matching + w_sig * sigreg(z_current.unsqueeze(0))
-        if not torch.isfinite(loss):
-            raise ValueError("Nonfinite pretraining loss")
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
-        if step == 1 or step % log_every == 0 or step == steps:
-            trace.append({"step": step, "loss": float(loss.detach()),
-                          "matching": float(matching.detach())})
-            logging.info("pretrain %s lag=%s w_sig=%s step %s/%s loss=%.6f",
-                         mode, lag, w_sig, step, steps, float(loss.detach()))
+        if step == 1 or step % 100 == 0 or step % log_every == 0 or step == steps:
+            loss_val = float(loss.detach())
+            match_val = float(matching.detach())
+            if not np.isfinite(loss_val) or not np.isfinite(match_val):
+                raise ValueError(f"Nonfinite pretraining loss at step {step}")
+            if step == 1 or step % log_every == 0 or step == steps:
+                trace.append({"step": step, "loss": loss_val, "matching": match_val})
+                logging.info("pretrain %s lag=%s w_sig=%s step %s/%s loss=%.6f",
+                             mode, lag, w_sig, step, steps, loss_val)
+    del pretrain_imgs, states_gpu, ep_all, anc_all
     encoder.eval()
     if predictor is not None:
         predictor.eval()
     return encoder, predictor, trace
-
 
 # --------------------------------------------------------------------------- #
 # Probe
@@ -277,15 +340,17 @@ class Probe(nn.Module):
 
 
 @torch.inference_mode()
-def encode_states(encoder, states, device, batch=512, noise_seed=0):
-    states = np.asarray(states, dtype=np.float32)
-    rng = np.random.default_rng(noise_seed)
+def encode_states(encoder, states, device, batch=4096, noise_seed=0):
+    device = torch.device(device)
+    states_t = torch.as_tensor(np.asarray(states, dtype=np.float32), device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(int(noise_seed))
+    eff_batch = max(int(batch), 4096) if device.type == "cuda" else int(batch)
     output = []
-    for start in range(0, len(states), batch):
-        image = torch.from_numpy(render_states(states[start:start + batch], rng=rng)).to(device)
+    for start in range(0, len(states_t), eff_batch):
+        image = render_states_torch(states_t[start:start + eff_batch], device=device, noise_gen=gen)
         output.append(encoder(image).cpu().numpy())
     return np.concatenate(output).astype(np.float32, copy=False)
-
 
 def fit_probe(train_x, train_y, val_x, val_y, *, seed, device,
               steps=3000, batch=256, lr=1e-3, wd=1e-4):
@@ -304,14 +369,16 @@ def fit_probe(train_x, train_y, val_x, val_y, *, seed, device,
     for step in range(1, steps + 1):
         ids = torch.randint(len(x), (batch,), device=device)
         loss = (probe(x[ids]) - y[ids]).square().mean()
-        if not torch.isfinite(loss):
-            raise ValueError("Nonfinite probe loss")
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
         if step == 1 or step % 100 == 0 or step == steps:
+            if not torch.isfinite(loss):
+                raise ValueError("Nonfinite probe loss")
             with torch.no_grad():
                 val_loss = (probe(vx) - vy).square().mean().item()
+            if not np.isfinite(val_loss):
+                raise ValueError("Nonfinite probe validation loss")
             trace.append({"step": step, "train_loss": float(loss.detach()),
                           "val_loss": val_loss})
             if val_loss < best_loss:
@@ -370,18 +437,30 @@ def _residualize(design, controls):
     return design - controls @ beta
 
 
-def variance_decomposition(pred_ref, true_ref):
+def variance_decomposition(pred_ref, true_ref, lags=LAGS):
     """Orthogonal decomposition of each fast-axis prediction on REF."""
-    pred = np.asarray(pred_ref, dtype=np.float64).reshape(-1, 4)
-    true = np.asarray(true_ref, dtype=np.float64).reshape(-1, 4)
+    pred_arr = np.asarray(pred_ref, dtype=np.float64)
+    true_arr = np.asarray(true_ref, dtype=np.float64)
+    pred = pred_arr.reshape(-1, 4)
+    true = true_arr.reshape(-1, 4)
     fast = true[:, list(FAST_AXES)]
     slow = true[:, [0, 1]]
     harmonic = _monomials_slow(slow)
-    # Standardize features to keep lstsq well conditioned.
+
+    phys_v = true.var(0)
+    pred_v = pred.var(0)
+    valid_lags = tuple(h for h in lags if 0 < h < pred_arr.shape[1]) or (1,)
+    if np.all(phys_v > 0) and np.all(pred_v > 0):
+        ref_scores = score_windows(pred_arr, true_arr, phys_v, pred_v, valid_lags)
+        score_shifts = (ref_scores["predicted_scores"] - ref_scores["true_scores"]).mean(axis=0)
+    else:
+        score_shifts = np.full(4, np.nan, dtype=np.float64)
+
     def std(mat):
         mu = mat.mean(0)
         sd = np.maximum(mat.std(0), 1e-8)
         return (mat - mu) / sd
+
     fast_s, slow_s, harmonic_s = std(fast), std(slow), std(harmonic)
     out = {"axes": {}}
     for j in FAST_AXES:
@@ -393,42 +472,51 @@ def variance_decomposition(pred_ref, true_ref):
         harmonic_r2, proj_harmonic = _r2(y, harmonic_res)
         residual = y - proj_fast - proj_slow - proj_harmonic
         residual_frac = max(0.0, 1.0 - fast_r2 - slow_r2 - harmonic_r2)
-        episodes = residual.reshape(pred_ref.shape[0], pred_ref.shape[1])
+        episodes = residual.reshape(pred_arr.shape[0], pred_arr.shape[1])
         correlations = []
         for row in episodes:
             if len(row) > 2 and np.std(row[:-1]) > 1e-12 and np.std(row[1:]) > 1e-12:
                 correlations.append(float(np.corrcoef(row[:-1], row[1:])[0, 1]))
+        shift_j = float(score_shifts[j]) if np.isfinite(score_shifts[j]) else None
         out["axes"][str(j)] = {
             "pred_over_phys_ref_var": float(np.var(pred[:, j]) / np.var(true[:, j])),
             "true_fast_frac": fast_r2,
             "linear_slow_frac": slow_r2,
             "harmonic_slow_frac": harmonic_r2,
+            "total_slow_frac": float(slow_r2 + harmonic_r2),
             "residual_frac": residual_frac,
-            "mean_score_shift": float((pred[:, j] - true[:, j]).mean()
-                                      / max(true[:, j].std(), 1e-12)),
+            "mean_score_shift": shift_j,
             "residual_lag1_autocorr": float(np.nanmean(correlations)) if correlations else None,
         }
     for key in ("pred_over_phys_ref_var", "true_fast_frac", "linear_slow_frac",
-                "harmonic_slow_frac", "residual_frac", "mean_score_shift",
-                "residual_lag1_autocorr"):
+                "harmonic_slow_frac", "total_slow_frac", "residual_frac",
+                "mean_score_shift", "residual_lag1_autocorr"):
         values = [out["axes"][str(j)][key] for j in FAST_AXES]
         values = [v for v in values if v is not None]
         out[f"mean_{key}"] = float(np.mean(values)) if values else None
     return out
 
 
-def classify_regime(decomposition):
+def classify_regime(decomposition, audit_min_r2=None, audit_threshold=0.85):
     fast = decomposition["mean_true_fast_frac"]
-    linear = decomposition["mean_linear_slow_frac"]
-    harmonic = decomposition["mean_harmonic_slow_frac"]
-    if fast >= 0.5:
+    slow_total = decomposition["mean_linear_slow_frac"] + decomposition["mean_harmonic_slow_frac"]
+    residual = decomposition["mean_residual_frac"]
+    var_ratio = decomposition["mean_pred_over_phys_ref_var"]
+    shift = decomposition.get("mean_score_shift")
+    if audit_min_r2 is not None:
+        if audit_min_r2 >= audit_threshold:
+            return "Normal Recovery"
+    elif fast >= 0.85 and var_ratio >= 0.70:
         return "Normal Recovery"
-    if linear >= 0.5 and linear >= harmonic:
-        return "Regime II-A"
-    if harmonic >= 0.5:
+    if shift is not None and shift < -0.05 and (slow_total >= 0.25 or var_ratio < 0.05):
         return "Regime II-B"
+    if slow_total >= 0.50:
+        return "Regime II-B"
+    if shift is not None and shift > 0.02 and slow_total < 0.25:
+        return "Regime II-A"
+    if residual >= slow_total and (shift is None or shift >= -0.02):
+        return "Regime II-A"
     return "Mixed"
-
 
 # --------------------------------------------------------------------------- #
 # Pre-Test Forecast Lock pipeline
@@ -545,7 +633,7 @@ def run_cell(encoder, data, *, out_dir, cell, seed, alpha, device,
         "physical_ref_variance": physical_var.tolist(),
         "predicted_over_physical_variance": (predicted_var / physical_var).tolist(),
         "decomposition": decomposition,
-        "regime": classify_regime(decomposition),
+        "regime": classify_regime(decomposition, audit_min_r2=audit["minimum_r2"]),
         "window_groups": _group_stats(test_scores, threshold),
         "threshold": threshold,
         "risk": result,
