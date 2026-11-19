@@ -198,8 +198,15 @@ def main():
                                        or path.name in SELECTED_BINARIES
                                        or (path.name.startswith("probe")
                                            and path.suffix == ".pt")))
+    sizes = {}
     for path in (LIGHT, FULL):
-        print(f"{path.name} bytes={path.stat().st_size} sha256={sha256(path)}")
+        sizes[path.name] = path.stat().st_size
+        print(f"{path.name} bytes={sizes[path.name]} sha256={sha256(path)}")
+    light_bytes = sizes[LIGHT.name]
+    if light_bytes >= 5 * 1024 * 1024:
+        print(f"ERROR: {LIGHT.name} is {light_bytes} bytes, over the 5 MiB light limit",
+              file=sys.stderr)
+        all_ok = False
     print(f"all_ok={all_ok}")
     return 0 if all_ok else 1
 

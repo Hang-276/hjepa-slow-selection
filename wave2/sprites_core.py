@@ -31,6 +31,9 @@ from metrics import risk, score_windows  # noqa: E402
 IMG = 32
 LAGS = (4, 16, 32)
 FAST_AXES = (2, 3)
+SIGMA = 2.2
+AMP = 0.86
+PIXEL_NOISE = 0.01
 ROLES = ("pretrain", "train", "val", "audit", "ref", "cal", "test")
 ROLE_SHAPES = {
     "pretrain": (1024, 128),
@@ -127,14 +130,14 @@ def render_states(states, rng=None):
     for k in range(2):
         dx = xs[None, :, :] - centers[:, k, 0][:, None, None]
         dy = ys[None, :, :] - centers[:, k, 1][:, None, None]
-        sprites[:, k] = np.exp(-(dx * dx + dy * dy) / (2.0 * 2.2**2))
-    red = 0.045 + 0.015 * (x * y) + 0.86 * sprites[:, 0]
-    blue = 0.050 + 0.015 * ((1.0 - x) * y) + 0.86 * sprites[:, 1]
+        sprites[:, k] = np.exp(-(dx * dx + dy * dy) / (2.0 * SIGMA**2))
+    red = 0.045 + 0.015 * (x * y) + AMP * sprites[:, 0]
+    blue = 0.050 + 0.015 * ((1.0 - x) * y) + AMP * sprites[:, 1]
     green = (0.065 + 0.020 * np.sin(np.pi * (x + y))
              + 0.035 * (sprites[:, 0] + sprites[:, 1]))
     image = np.stack([red, green, blue], axis=1).astype(np.float32)
     if rng is not None:
-        image = image + 0.01 * rng.standard_normal(image.shape).astype(np.float32)
+        image = image + PIXEL_NOISE * rng.standard_normal(image.shape).astype(np.float32)
     return np.clip(image, 0.0, 1.0)
 
 
@@ -218,14 +221,15 @@ def pretrain_encoder(pretrain_states, *, mode, lag, w_sig, seed, device,
         raise ValueError("pretrain sequences are too short for the shared anchor set")
     anchors = seq_len - MAX_LAG
     trace = []
+    render_rng = np.random.default_rng(seed + 7919)
     encoder.train()
     for step in range(1, steps + 1):
         episode = rng.integers(0, n_episodes, batch)
         anchor = rng.integers(0, anchors, batch)
         current_states = pretrain_states[episode, anchor]
         target_states = pretrain_states[episode, anchor + lag]
-        current = torch.from_numpy(render_states(current_states)).to(device)
-        target = torch.from_numpy(render_states(target_states)).to(device)
+        current = torch.from_numpy(render_states(current_states, rng=render_rng)).to(device)
+        target = torch.from_numpy(render_states(target_states, rng=render_rng)).to(device)
         z_current = encoder(current)
         if mode == "symmetric_lejepa":
             # Symmetric LeJEPA: both views are encoded with gradients.
@@ -273,11 +277,12 @@ class Probe(nn.Module):
 
 
 @torch.inference_mode()
-def encode_states(encoder, states, device, batch=512):
+def encode_states(encoder, states, device, batch=512, noise_seed=0):
     states = np.asarray(states, dtype=np.float32)
+    rng = np.random.default_rng(noise_seed)
     output = []
     for start in range(0, len(states), batch):
-        image = torch.from_numpy(render_states(states[start:start + batch])).to(device)
+        image = torch.from_numpy(render_states(states[start:start + batch], rng=rng)).to(device)
         output.append(encoder(image).cpu().numpy())
     return np.concatenate(output).astype(np.float32, copy=False)
 

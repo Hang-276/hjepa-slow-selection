@@ -211,7 +211,7 @@ def main():
                 cls_l1 = {role: sliced[role][0] for role in fc.NONTEST_ROLES}
                 mean, basis, explained, eigenvalues = pca_fit(grid["train"], PCA_DIM, args.device)
                 q_basis = random_projection(seed)
-                projections[seed] = {
+                projections[(tag, seed)] = {
                     "pca192": {"mean": mean, "basis": basis, "explained": explained,
                                "top_eigenvalues": eigenvalues.tolist()},
                     "rand192": {"mean": np.zeros(3072, np.float64), "basis": q_basis},
@@ -226,7 +226,7 @@ def main():
                              projection_meta[f"{tag}_seed{seed}"])
                 proj_features = {}
                 for projection in PROJECTIONS:
-                    info = projections[seed][projection]
+                    info = projections[(tag, seed)][projection]
                     proj_features[projection] = {
                         role: apply_projection(grid[role], info["mean"], info["basis"],
                                                args.device)
@@ -334,10 +334,10 @@ def main():
                 del model
                 test_features = {
                     "cls": cls_test[0],
-                    "pca192": apply_projection(grid_test, projections[seed]["pca192"]["mean"],
-                                               projections[seed]["pca192"]["basis"], args.device),
-                    "rand192": apply_projection(grid_test, projections[seed]["rand192"]["mean"],
-                                                projections[seed]["rand192"]["basis"], args.device),
+                    "pca192": apply_projection(grid_test, projections[(tag, seed)]["pca192"]["mean"],
+                                               projections[(tag, seed)]["pca192"]["basis"], args.device),
+                    "rand192": apply_projection(grid_test, projections[(tag, seed)]["rand192"]["mean"],
+                                                projections[(tag, seed)]["rand192"]["basis"], args.device),
                 }
                 for projection in PROJECTIONS:
                     for readout, _ in CELL_SPECS:
