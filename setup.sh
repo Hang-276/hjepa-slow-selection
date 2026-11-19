@@ -41,7 +41,7 @@ python="$root/.venv/bin/python"
 "$python" -m pip install --index-url https://download.pytorch.org/whl/cu128 \
     'torch==2.7.1+cu128' 'torchvision==0.22.1+cu128'
 "$python" -m pip install \
-    'transformers>=4.50,<5' 'huggingface-hub>=0.30,<1' 'gymnasium==1.2.3' \
+    'transformers==5.9.0' 'huggingface-hub==1.5.0' 'gymnasium==1.2.3' \
     einops numpy scipy h5py hdf5plugin hydra-core loguru rich tqdm
 "$python" -m pip check
 
